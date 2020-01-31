@@ -1,0 +1,30 @@
+Package: TDA-TCGA
+Type: Package
+Title: Pipeline for the Identification of Novel Driver Genes Using TDA
+Version: 0.1.0
+Author: person("Pablo G.", "Camara", email = "pcamara@upenn.edu", role = c("aut", "cre"))
+Description: This package processes expression and mutation data,
+    creates a network representation of the expression space
+    using Mapper, and assesses the amount of localization
+    of the mutational load in the expression networks.
+Depends: R(>= 3.4.1)
+License: MIT
+Encoding: UTF-8
+LazyData: true
+Imports:
+    igraph,
+    rgexf,
+    jsonlite,
+    parallel,
+    getopt,
+    data.table,
+    rhdf5,
+    ggplot2,
+    stringr,
+    dplyr,
+    TDAmapper
+Remotes: 
+LinkingTo:
+NeedsCompilation: yes
+RoxygenNote: 6.0.1.9000
+
