@@ -1,0 +1,464 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r constants}
+output.dir = "/home/rstudio/d/GRN_bootstrapping/data/"
+```
+
+```{r libs}
+library(TDAmapper)
+library(igraph)
+library(fastcluster) 
+library(purrr)
+library(Matrix)
+library(ggplot2)
+library(umap)
+library(dplyr)
+library(velocyto.R)
+```
+
+```{r general_funcs}
+# sample.with.replacement = function(latent) {
+#    subsample = sample(nrow(latent), nrow(latent), replace=T)
+#    latent[subsample, ]
+# }
+
+sample.without.replacement = function(latent, fraction) {
+   n = round(fraction * nrow(latent))
+   subsample = sample(n, n, replace=F)
+   latent[subsample, ]
+}
+
+build.cover = function(filter_values=umap_emb, num_intervals=c(20, 20), percent_overlap=10) {
+  filter_min_1 <- min(filter_values[[1]])
+  filter_max_1 <- max(filter_values[[1]])
+  filter_min_2 <- min(filter_values[[2]])
+  filter_max_2 <- max(filter_values[[2]])
+  
+  interval_length_1 <- (filter_max_1 - filter_min_1) / (num_intervals[1] - (num_intervals[1] - 1) * percent_overlap/100 )
+  interval_length_2 <- (filter_max_2 - filter_min_2) / (num_intervals[2] - (num_intervals[2] - 1) * percent_overlap/100 )
+  
+  step_size_1 <- interval_length_1 * (1 - percent_overlap/100)
+  step_size_2 <- interval_length_2 * (1 - percent_overlap/100)
+  
+  num_levels <- num_intervals[1] * num_intervals[2]
+  
+  cover = list()
+  
+  level_indices_1 <- rep(1:num_intervals[1], num_intervals[2])
+  level_indices_2 <- rep(1:num_intervals[2], each=num_intervals[1]) 
+  # begin mapper main loop
+  for (level in 1:num_levels) {
+    level_1 <- level_indices_1[level]
+    level_2 <- level_indices_2[level]
+    
+    min_value_in_level_1 <- filter_min_1 + (level_1 - 1) * step_size_1
+    min_value_in_level_2 <- filter_min_2 + (level_2 - 1) * step_size_2
+    max_value_in_level_1 <- min_value_in_level_1 + interval_length_1
+    max_value_in_level_2 <- min_value_in_level_2 + interval_length_2
+    
+    cover[[level]] = c(min_value_in_level_1, max_value_in_level_1, min_value_in_level_2, max_value_in_level_2)
+  } # end mapper main loop
+  
+  cover
+}
+
+average.expression.for.node = function(points_in_vertex, expression) {
+  M <- Matrix(0, nrow=length(points_in_vertex), ncol=ncol(expression), dimnames=list(NULL, colnames(expression)))
+
+  for (i in 1:length(points_in_vertex)) {
+    points = points_in_vertex[[i]]
+    if (length(points) == 1) {
+      M[i, ] <- expression[points, ]
+    }
+    else {
+      M[i, ] <- apply(expression[points, ], 2, mean)
+    }
+  }
+
+  M
+}
+
+plot.umap = function(emb) {
+  ggplot(emb) +
+    geom_point(aes(x=V2, y=V3, color=0), size=0.9)
+}
+
+plot.mapper.auc = function(g, auc, r) {
+  my_resolution = 100
+  my_palette    = colorRampPalette(c('blue','red'))
+  my_vector = auc[r, ]
+  my_colors = my_palette(my_resolution)[as.numeric(cut(my_vector, breaks=my_resolution))]
+  plot(g, vertex.color=my_colors, main=r)
+}
+
+write.edges = function(n, graph) {
+  file = paste0(output.dir, n, "_edges.txt")
+  sink(file)
+  adj <- as_adjacency_matrix(graph)
+  for (i in 1:nrow(adj)) {
+    for (j in 1:ncol(adj)) {
+      if (adj[i, j] == 1) {
+        cat(paste(i, j, sep=","))
+        cat("\n")
+      }
+    }
+  }
+  sink()
+}
+
+write.pngs = function(n, umap, graph) {
+  png(paste0(output.dir, n, "_graph.png"))
+  plot(graph)
+  dev.off()
+
+  png(paste0(output.dir, n, "_umap.png"))
+  #plot.umap(umap %>% as.data.frame)
+  plot.umap(umap)
+  dev.off()
+}
+
+write.auc_csv = function(n, auc) {
+   file = paste0(output.dir, n, "_auc.csv")
+   write.csv(x=auc %>% as.matrix, file=file, row.names=T)
+}
+```
+
+```{r collapse_funcs}
+garrows.within.mapper.level = function(garrows, points_in_level, cover_window) { # should be avg g arrows within..
+  if (length(points_in_level) == 0) {
+    return(NULL)
+  }
+  
+  df = dplyr::filter(garrows %>% as.data.frame, x0 >= cover_window[1] & x1 <= cover_window[2] & y0 >= cover_window[3] & y1 <= cover_window[4])
+  
+  if (nrow(df) == 0) {
+    return(NULL)
+  }
+  
+  df %>% as.matrix %>% colMeans
+}
+
+target.mapper.level = function(level.arrow, cover, level.i, cover.size=20) {
+  if (is.null(level.arrow)) {
+    return(NULL)
+  }
+
+  # do manipulations of level.i to see neighbour up, down, left, right
+  north = ifelse(level.i + cover.size > length(cover), NA, level.i + cover.size)
+  south = ifelse(level.i - cover.size < 1, NA, level.i - cover.size)
+  west = ifelse(level.i %in% seq(1, length(cover), by=cover.size), NA, level.i - 1)
+  east = ifelse(level.i %in% seq(cover.size, length(cover), by=cover.size), NA, level.i + 1)
+
+  nw = ifelse(is.na(north) || is.na(west), NA, north - 1)
+  ne = ifelse(is.na(north) || is.na(east), NA, north + 1)
+  sw = ifelse(is.na(south) || is.na(west), NA, south - 1)
+  se = ifelse(is.na(south) || is.na(east), NA, south + 1)
+
+  edges = list()
+  
+  if (level.arrow[4] > level.arrow[2] && level.arrow[3] > level.arrow[1]) { # north east
+    edges <- list(north, east, ne) %>% keep(function(x) !is.na(x))
+  } else if (level.arrow[3] > level.arrow[1]) { # south east
+    edges <- list(south, east, se) %>% keep(function(x) !is.na(x))
+  } else if (level.arrow[4] > level.arrow[2]) { # north west
+    edges <- list(north, west, nw) %>% keep(function(x) !is.na(x))
+  } else { # south west
+    edges <- list(south, west, sw) %>% keep(function(x) !is.na(x))
+  }
+  
+  if (length(edges) == 0) {
+    edges <- NULL
+  }
+  edges %>% map(function(x) c(level.i, x))
+}
+
+direct = function(mapperObj, cover, garrows) {
+  cover.centers = cover %>% map(function(window) c((window[1] + window[2])/2, (window[3] + window[4])/2))
+  
+  mapper.level.arrows = 1:length(cover) %>%
+    map(function(i) garrows.within.mapper.level(garrows, mapperObj$points_in_level[[i]], cover[[i]]))
+
+  edges.between.levels = 1:length(cover) %>%
+    map(function(i) target.mapper.level(mapper.level.arrows[[i]], cover.centers, i)) %>%
+    unlist(recursive=F)
+  
+  edges.between.nodes = edges.between.levels %>%
+    map(function(e) {
+      ret <- NULL
+      for (v1 in mapperObj$vertices_in_level[[e[1]]]) {
+        for (v2 in mapperObj$vertices_in_level[[e[2]]]) {
+          if (v1 != -1 && v2 != -1) {
+            ret <- c(ret, list(c(v1, v2)))
+          }
+        }
+      }
+      ret
+    }) %>%
+    keep(function(x) !is.null(x)) %>%
+    unlist(recursive=F)
+
+  garrows.adj_matrix <- matrix(0, nrow=nrow(mapperObj$adjacency), ncol=ncol(mapperObj$adjacency))
+  for (edge in edges.between.nodes) {
+      i = edge[1]
+      j = edge[2]
+      if (mapperObj$adjacency[i,j] == 1) {
+        garrows.adj_matrix[i, j] <- 1
+      }
+  }
+  
+  g_directed_adj <- garrows.adj_matrix
+  edge_j <- 1
+  for (i in 1:nrow(g_directed_adj)) {
+     for (j in 1:ncol(g_directed_adj)) {
+         if (mapperObj$adjacency[i,j] == 1 && garrows.adj_matrix[i, j] == 0 && garrows.adj_matrix[j, i] == 0) {
+           g_directed_adj[i, j] <- 1
+         }
+     }
+  }
+
+  g_directed <- graph_from_adjacency_matrix(g_directed_adj)
+
+  g_directed$level_of_vertex <- mapperObj$level_of_vertex
+  g_directed$points_in_vertex <- mapperObj$points_in_vertex
+  g_directed$points_in_level <- mapperObj$points_in_level
+  g_directed$level_of_vertex <- mapperObj$level_of_vertex
+  g_directed$vertices_in_level <- mapperObj$vertices_in_level
+
+  g_directed
+}
+
+collapse = function(graph) {
+  adj = as_adjacency_matrix(graph)
+  collapsed_adj <- adj
+  for (i in 1:nrow(adj)) {
+    for (j in 1:ncol(adj)) {
+      if (adj[i, j] == 1 && length(graph$points_in_vertex[[j]]) == 1) {
+          collapsed_adj[i, j] <- 0 # moving to here to always remove
+          for (k in 1:ncol(adj)) {
+            if (adj[j, k] == 1) {
+              # ok. so remove i -> j and j -> k and add i -> k?
+              collapsed_adj[j, k] <- 0
+              if (i != k) {
+                collapsed_adj[i, k] <- 1
+              }
+            }
+          }
+      }
+      if (adj[i, j] == 1 && length(graph$points_in_vertex[[i]]) == 1) { # need to do the other way too right
+        collapsed_adj[i, j] <- 0 # moving to here to always remove
+        
+        # this is new and i'm not sure it's correct
+          for (k in 1:ncol(adj)) {
+            if (adj[k, i] == 1) {
+              collapsed_adj[k, i] <- 0
+              if (j != k) {
+                collapsed_adj[k, j] <- 1
+              }
+            }
+          }
+      }
+    }
+  }
+  
+  g_collapsed <- graph_from_adjacency_matrix(collapsed_adj)
+  
+  g_collapsed$level_of_vertex <- graph$level_of_vertex
+  g_collapsed$points_in_vertex <- graph$points_in_vertex
+  g_collapsed$points_in_level <- graph$points_in_level
+  g_collapsed$level_of_vertex <- graph$level_of_vertex
+  g_collapsed$vertices_in_level <- graph$vertices_in_level
+
+  g_collapsed
+}
+
+# this also removes bidirectional edges
+add_self_edges = function(graph) {
+  adj <- as_adjacency_matrix(graph)
+  self_adj = adj
+  
+  for (i in 1:ncol(adj)) {
+    if (sum(adj[i, ]) == 0 && sum(adj[, i] != 0)) { 
+    #if (sum(adj[, i]) == 0) {
+       # remove the green
+      self_adj[i, i] <- 1
+    }
+  }
+  
+  # remove bidirectional edges
+  for (i in 1:nrow(adj)) {
+    for (j in 1:ncol(adj)) {
+      if (adj[i, j] == 1 && adj[j, i] == 1) {
+        self_adj[i,j] <- 0
+      }
+    }
+  }
+  
+  g_selfedge <- graph_from_adjacency_matrix(self_adj)
+  
+  g_selfedge$level_of_vertex <- graph$level_of_vertex
+  g_selfedge$points_in_vertex <- graph$points_in_vertex
+  g_selfedge$points_in_level <- graph$points_in_level
+  g_selfedge$level_of_vertex <- graph$level_of_vertex
+  g_selfedge$vertices_in_level <- graph$vertices_in_level
+  
+  V(g_selfedge)$size <- log2(as.numeric(lapply(g_selfedge$points_in_vertex, length))+1)
+  E(g_selfedge)$size <- rep(0, gsize(g_selfedge))
+  V(g_selfedge)$label <- ""
+  V(g_selfedge)$frame.color <- "black"
+  
+  g_selfedge
+}
+
+plot.cover = function(latent, umap_emb) {
+    corr_dist = (1.0 - cor(t(latent)))
+  mapperObj = mapper2D(corr_dist, umap_emb, c(20, 20), 30, 5)
+  cover = build.cover(umap_emb, c(20, 20), 30)
+  
+  # temp, debugging
+  cover.df = as.data.frame(do.call(rbind, cover))
+  plot.umap(umap_emb) + geom_rect(data=cover.df, mapping=aes(xmin=V1, xmax=V2, ymin=V3, ymax=V4),
+                               color="black", alpha=0.5)
+}
+
+build.graph = function(latent, umap_emb, garrows) {
+  corr_dist = (1.0 - cor(t(latent)))
+  mapperObj = mapper2D(corr_dist, umap_emb, c(20, 20), 30, 5)
+  cover = build.cover(umap_emb, c(20, 20), 30)
+
+  my_g_directed = direct(mapperObj, cover, garrows)
+  my_g_collapsed_selfedges = add_self_edges(collapse(my_g_directed))
+
+  my_g_collapsed_selfedges
+}
+```
+
+
+```{r load}
+latent = read.csv("filtered_latent.csv", header=F, stringsAsFactors=F, row.names=1)
+umap_emb = read.csv("filtered_umap_embedding.csv", header=F, stringsAsFactors=F, row.names=1)
+rna_vel.results = readRDS("rna_velocity/rna_velocity_results.rds")
+rvel.cd = readRDS("rna_velocity/rvel.cd.rds")
+
+regulons.to.use = c("Arx(+)", "Atf1(+)", "Bach1(+)", "Bach2(+)", "Brca1(+)", "Deaf1(+)", "Dlx1(+)", "Dlx2(+)", "Dlx5(+)", "Dlx6(+)",
+                    "E2f1(+)", "E2f2(+)", "E2f3(+)", "E2f4(+)", "E2f5(+)", "E2f6(+)", "Erf(+)", "Foxd1(+)", "Gata2(+)",
+                    "Hes1(+)", "Hes5(+)", "Hey1(+)", "Lhx2(+)", "Mga(+)", "Msx3(+)", "Neurod1(+)", "Neurod2(+)", "Neurog1(+)",
+                    "Nfia(+)", "Nhlh1(+)", "Nhlh2(+)", "Nr4a1(+)", "Olig1(+)", "Olig2(+)", "Pax3(+)", "Pax6(+)", "Rcor1(+)", "Rfx4(+)",
+                    "Shox2(+)", "Sox2(+)", "Sox9(+)", "Tal1(+)", "Tcf3(+)", "Tcf4(+)", "Tfdp2(+)", "Zic1(+)", "Gbx2(+)")
+regulon.auc = read.csv("scenic/binary_auc.csv", header=T, row.names=1)[regulons.to.use, latent %>% rownames] %>% as.matrix
+regulon.auc %>% dim
+
+plot.umap(umap_emb)
+plot.cover(latent, umap_emb) # temp, debugging
+g = build.graph(latent, umap_emb, rna_vel.results$garrows)
+plot(g)
+
+mapper.scenic.auc = average.expression.for.node(g$points_in_vertex, regulon.auc %>% t) %>% t
+
+plot.mapper.auc(g, mapper.scenic.auc, "Arx(+)")
+plot.mapper.auc(g, mapper.scenic.auc, "Sox2(+)")
+plot.mapper.auc(g, mapper.scenic.auc, "Gbx2(+)")
+plot.mapper.auc(g, mapper.scenic.auc, "Olig1(+)")
+plot.mapper.auc(g, mapper.scenic.auc, "Olig2(+)")
+```
+
+
+Bootstrapping seems to cause artifacts in the UMAP due to identical points. Subsampling works great, but will have to compare to results which were also created from 75% of the data.
+
+docker run -d --rm -p 8787:8787 -v "/c/:/home/rstudio/c" -v "/d/:/home/rstudio/d" -e USER=rstudio -e PASSWORD= camaralab/rna-velocity:r_studio
+need to install whole bunch of packages
+and
+
+docker exec dreamy_almeida pip install umap-learn
+
+
+```{r subsample}
+latent.subsample <- sample.without.replacement(latent, 0.75)
+#umap.subsample <- umap(latent.subsample, method="umap-learn")$layout %>% as.data.frame
+umap.subsample <- umap(latent.subsample, method="naive")$layout %>% as.data.frame # temp
+colnames(umap.subsample) <- colnames(umap_emb)
+
+
+# working on this......................................................
+# turns out we need to recompute garrows
+rvel.cd = readRDS("rna_velocity/rvel.cd.rds")
+rvel.cd %>% names
+
+regulon.auc.subsample = regulon.auc[, rownames(umap.subsample)]
+  
+# temp
+umap_emb <- read.table("filtered_umap_embedding.csv", sep=",", header=FALSE, row.names=1, stringsAsFactors=FALSE)
+cell_names <- lapply(row.names(umap_emb), function(x) paste("WT_thalamus_1558733307_mm10_SingleCell:", strsplit(x, ".", fixed=TRUE)[[1]][1], "x", sep=""))
+row.names(umap_emb) <- cell_names
+
+umap_emb <- as.matrix(umap_emb)
+
+results = show.velocity.on.embedding.cor(umap_emb,rvel.cd,n=200,scale='log',cex=0.8,arrow.scale=1,show.grid.flow=T,min.grid.cell.mass=0.5,grid.n=20,arrow.lwd=0.5,do.par=F,cell.border.alpha = 0.1, plot.grid.points = T, return.details = T)
+
+#results = show.velocity.on.embedding.cor(umap.subsample,rvel.cd,n=200,scale='log',cex=0.8,arrow.scale=1,show.grid.flow=T,min.grid.cell.mass=0.5,grid.n=20,arrow.lwd=0.5,do.par=F,cell.border.alpha = 0.1, plot.grid.points = T, return.details = T)
+
+cell_names <- lapply(row.names(umap.subsample), function(x) paste("WT_thalamus_1558733307_mm10_SingleCell:", strsplit(x, ".", fixed=TRUE)[[1]][1], "x", sep=""))
+row.names(umap.subsample) <- cell_names
+
+umap.subsample <- as.matrix(umap.subsample)
+
+
+
+
+
+# trying this.. do i need to update the cell names etc.. probably easy to do via the subsample from the umap in the first place..
+results = show.velocity.on.embedding.cor(umap.subsample,rvel.cd,n=200,scale='log',cex=0.8,arrow.scale=1,show.grid.flow=T,min.grid.cell.mass=0.5,grid.n=20,arrow.lwd=0.5,do.par=F,cell.border.alpha = 0.1, plot.grid.points = T, return.details = T)
+
+plot.umap(umap.subsample %>% as.data.frame)
+plot.cover(latent.subsample, umap.subsample %>% as.data.frame) # temp, debugging
+g_subsample = build.graph(latent.subsample, umap.subsample %>% as.data.frame, results$garrows)
+plot(g_subsample)
+
+
+mapper.scenic.auc_subsample = average.expression.for.node(g_subsample$points_in_vertex, regulon.auc.subsample %>% t) # this is working. think plotting is wrong, colour calculation
+
+plot.mapper.auc(g_subsample, mapper.scenic.auc_subsample %>% t, "Arx(+)")
+plot.mapper.auc(g_subsample, mapper.scenic.auc_subsample %>% t, "Sox2(+)")
+plot.mapper.auc(g_subsample, mapper.scenic.auc_subsample %>% t, "Gbx2(+)")
+plot.mapper.auc(g_subsample, mapper.scenic.auc_subsample %>% t, "Olig1(+)")
+plot.mapper.auc(g_subsample, mapper.scenic.auc_subsample %>% t, "Olig2(+)")
+```
+
+
+
+
+# Run 1000 times and dump image of image, image of graph, edges txt file, auc csv
+
+```{r}
+do.bootstrapping = function(i) {
+  latent.subsample <- sample.without.replacement(latent, 0.75)
+  #umap.subsample <- umap(latent.subsample, method="umap-learn")$layout %>% as.data.frame
+  umap.subsample <- umap(latent.subsample, method="naive")$layout %>% as.data.frame # temp
+  colnames(umap.subsample) <- colnames(umap_emb)
+
+  regulon.auc.subsample = regulon.auc[, rownames(umap.subsample)]
+
+  cell_names <- lapply(row.names(umap.subsample), function(x) paste("WT_thalamus_1558733307_mm10_SingleCell:", strsplit(x, ".", fixed=TRUE)[[1]][1], "x", sep=""))
+  row.names(umap.subsample) <- cell_names
+  umap.subsample <- as.matrix(umap.subsample)
+
+  results = show.velocity.on.embedding.cor(umap.subsample,rvel.cd,n=200,scale='log',cex=0.8,arrow.scale=1,show.grid.flow=T,min.grid.cell.mass=0.5,grid.n=20,arrow.lwd=0.5,do.par=F,cell.border.alpha = 0.1, plot.grid.points = T, return.details = T)
+  g_subsample = build.graph(latent.subsample, umap.subsample %>% as.data.frame, results$garrows)
+  mapper.scenic.auc_subsample = average.expression.for.node(g_subsample$points_in_vertex, regulon.auc.subsample %>% t) # this is working. think plotting is wrong, colour calculation
+
+  write.pngs(i, umap.subsample %>% as.data.frame, g_subsample)
+  write.edges(i, g_subsample)
+  write.auc_csv(i, mapper.scenic.auc_subsample)
+}
+```
+
+```{r}
+do.bootstrapping(1)
+```
+
+```{r}
+2:1000 %>% walk(do.bootstrapping)
+```
+
