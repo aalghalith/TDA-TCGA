@@ -9,8 +9,14 @@ library(TDAmapper)
 library(umap)
 library(dbscan)
 library(RayleighSelection)
+library(Seurat)
+library(cccd)
+library(maftools)
 
-create_mut_object <- function(exp_table, mut_table, filter_method, max_interval, max_percent_overlap, var_threshold, num_cores=1) {
+create_mut_object <- function(exp_table, mut_table, filter_method = UMAP, k = 30,
+                              min_interval = 10, max_interval, interval_step = 10,
+                              min_percent_overlap = 20, max_percent_overlap, percent_step = 10,
+                              var_threshold = 4500, num_cores=1) {
 
 
   # FUNCTIONS ---------------------------------------------------------------
@@ -21,6 +27,8 @@ create_mut_object <- function(exp_table, mut_table, filter_method, max_interval,
   }
 
   build.mapper = function(dist, umap_emb, num_intervals, percent_overlap) {
+    sink('NULL')
+    sink()
     mapper2D(dist, umap_emb, num_intervals, percent_overlap)
   }
 
@@ -137,7 +145,6 @@ create_mut_object <- function(exp_table, mut_table, filter_method, max_interval,
 
   # INPUT AND CLEAN ---------------------------------------------------------
 
-    # Cleaning tables
   #exp_table <- (read.csv("C:/Users/Adam/Desktop/Camara Lab/TDA_TCGA_Project/Test Data/LGG_Full_TPM_matrix.csv", row.names=1, header=T, stringsAsFactors=F, na.strings=c("NA","NaN", " ", "?"))) #Laptop
   exp_table <- (read.csv("/home/rstudio/documents/Test Data/LGG_Full_TPM_matrix.csv", row.names=1, header=T, stringsAsFactors=F, na.strings=c("NA","NaN", " ", "?"))) #Lab
   #mut_table <- (read.csv("blah", row.names=1, header=T, stringsAsFactors=F, na.strings=c("NA","NaN", " ", "?")))
@@ -160,56 +167,63 @@ create_mut_object <- function(exp_table, mut_table, filter_method, max_interval,
 
     # MAPPER PLOTS ---------------------------------------------------------
 
-    # Initialize parameters for several Mapper complexes
+  # Initialize parameters to build several Mapper complexes
+  interval_range <- seq(min_interval, max_interval, by = interval_step)
+  percent_range <- seq(min_percent_overlap, max_percent_overlap, by = percent_step)
 
-  num_intervals <- max_interval/10
-  #num_y_intervals <- max_y_intervals/10
-  start_interval <- max_interval - 10*(num_intervals - 1)
-  #start_y_interval <- max_y_interval - 10*(num_y_intervals - 1)
-  interval_range <- seq(start_interval, max_interval, length.out = num_intervals)
-  #y_interval_range <- seq(start_y_interval, max_y_interval, length.out = num_y_intervals)
+  if(!((max_interval - min_interval) %% interval_step)){
+    interval_range <- c(interval_range, max_interval)
+  }
 
-  num_percents <- max_percent_overlap/10
-  start_percent <- max_percent_overlap - 10*(num_percents - 1)
-  percent_range <- seq(start_percent, max_percent_overlap, length.out = num_percents)
+  if(!((max_percent_overlap - min_percent_overlap) %% percent_step)){
+    percent_range <- c(percent_range, max_percent_overlap)
+  }
 
   count = 0
+  num_complexes <- length(interval_range)*length(percent_range)
 
-  mapper_complexes <- vector('list',length(num_percents*num_intervals))
+  nerveComplexes <- vector('list',length = num_complexes)
 
 
-    # Filter Functions
+  # Filter Functions
 
   if (filter_method == "UMAP") {
 
     emb = umap(dist_matrix)$layout %>% as.data.frame
-    plot.umap(emb)
 
   }
 
     else if (filter_method == "PCA") {
       emb <- autoplot(prcomp(dist_matrix))$data[,1:2]
-      autoplot(prcomp(dist_matrix))
+      #autoplot(prcomp(dist_matrix))
     }
 
+      else if (filter_method == "KNN") {
+        knn_graph <- nng(dist_matrix, k)
+        knn_dist <- shortest.paths(knn_graph)
+        emb <- cmdscale(knn_dist,2)
+      }
+
       else {
-        print("Not a valid filter method")
+        warning("Not a valid filter method")
       }
 
   for (i in interval_range){
     for (p in percent_range){
       count = count + 1
-      print(paste0("Creating Mapper Complex ", count, " of ", num_intervals*num_percents))
+      message(paste0("Creating Mapper Complex ", count, " of ", num_complexes))
 
-      mapperObj <- capture.output ({ build.mapper(dist_matrix, emb, c(i,i), p) })
-      mapper_complexes[[count]] <- mapperObj
+      mapperObj <- build.mapper(dist_matrix, emb, c(i,i), p)
+      gg <- nerve_complex(mapperObj$points_in_vertex)
+      nerveComplexes[[count]] <- gg
 
     }
   }
 
-  class(mapper_complexes) <- "DriverMut_TDA"
+  mut_objects <- nerveComplexes
+  class(mut_objects) <- "DriverMut_TDA"
 
-  #return(capture.output({ mapper_complexes }))
+  return(mut_objects)
 
   #   # Laplacian eigenmap
   # leim <- LaplacianEigenmaps()
@@ -221,8 +235,3 @@ create_mut_object <- function(exp_table, mut_table, filter_method, max_interval,
 }
 
 
-suppressWarnings({
-  suppressMessages ({
-    library(TDAmapper, quietly=T, warn.conflicts=FALSE)
-  })
-})
